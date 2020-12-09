@@ -1,25 +1,47 @@
 package echoSwagger
 
 import (
-	"html/template"
-	"net/http"
-	"regexp"
-
 	"github.com/labstack/echo/v4"
 	"github.com/swaggo/files"
 	"github.com/swaggo/swag"
+	"html/template"
+	"log"
+	"net/http"
+	"path"
 )
 
 // Config stores echoSwagger configuration variables.
 type Config struct {
-	//The url pointing to API definition (normally swagger.json or swagger.yaml). Default is `doc.json`.
-	URL string
+	// If the Swagger specification JSON document is external to the web server, this should be set to the full URL
+	// to the specification document.
+	ExternalURL *string
+
+	// The information for OAuth2 integration, if any.
+	OAuth *OAuthConfig
+}
+
+// Configuration for Swagger UI OAuth2 integration. See
+// https://swagger.io/docs/open-source-tools/swagger-ui/usage/oauth2/ for further details.
+type OAuthConfig struct {
+	// The ID of the client sent to the OAuth2 IAM provider.
+	ClientId string
+
+	// The OAuth2 realm that the client should operate in. If not applicable, use empty string.
+	Realm string
+
+	// The name to display for the application in the authentication popup.
+	AppName string
+}
+
+type templateData struct {
+	SwaggerSpecFullURL string
+	Config
 }
 
 // URL presents the url pointing to API definition (normally swagger.json or swagger.yaml).
 func URL(url string) func(c *Config) {
 	return func(c *Config) {
-		c.URL = url
+		c.ExternalURL = &url
 	}
 }
 
@@ -31,9 +53,7 @@ func EchoWrapHandler(confs ...func(c *Config)) echo.HandlerFunc {
 
 	handler := swaggerFiles.Handler
 
-	config := &Config{
-		URL: "doc.json",
-	}
+	config := &Config{}
 
 	for _, c := range confs {
 		c(config)
@@ -41,34 +61,43 @@ func EchoWrapHandler(confs ...func(c *Config)) echo.HandlerFunc {
 
 	// create a template with name
 	t := template.New("swagger_index.html")
-	index, _ := t.Parse(indexTempl)
-
-	type pro struct {
-		Host string
+	index, err := t.Parse(indexTempl)
+	if err != nil {
+		log.Fatal("Unable to parse index.html template for echo-swagger:", err)
 	}
 
-	var re = regexp.MustCompile(`(.*)(index\.html|doc\.json|favicon-16x16\.png|favicon-32x32\.png|/oauth2-redirect\.html|swagger-ui\.css|swagger-ui\.css\.map|swagger-ui\.js|swagger-ui\.js\.map|swagger-ui-bundle\.js|swagger-ui-bundle\.js\.map|swagger-ui-standalone-preset\.js|swagger-ui-standalone-preset\.js\.map)[\?|.]*`)
-
 	return func(c echo.Context) error {
-		var matches []string
-		if matches = re.FindStringSubmatch(c.Request().RequestURI); len(matches) != 3 {
-
-			return c.String(http.StatusNotFound, "404 page not found")
-		}
-		path := matches[2]
-		prefix := matches[1]
+		prefix, pathFile := path.Split(c.Request().RequestURI)
 		handler.Prefix = prefix
 
-		switch path {
-		case "index.html":
+		templateData := templateData{
+			SwaggerSpecFullURL: path.Join(prefix, "doc.json"),
+			Config:             *config,
+		}
 
-			index.Execute(c.Response().Writer, config)
+		if config.ExternalURL != nil {
+			// Configuration specifies override for Swagger specification URL.
+			templateData.SwaggerSpecFullURL = *config.ExternalURL
+		}
+
+		switch pathFile {
+		case "":
+			fallthrough
+		case "index.html":
+			if err := index.Execute(c.Response().Writer, templateData); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, err)
+			}
 		case "doc.json":
-			doc, _ := swag.ReadDoc()
-			c.Response().Write([]byte(doc))
+			doc, err := swag.ReadDoc()
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, err)
+			}
+			c.Response().Header().Set("Content-Type", "application/json")
+			if _, err := c.Response().Write([]byte(doc)); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, err)
+			}
 		default:
 			handler.ServeHTTP(c.Response().Writer, c.Request())
-
 		}
 
 		return nil
@@ -150,7 +179,7 @@ const indexTempl = `<!-- HTML for static distribution bundle build -->
 window.onload = function() {
   // Build a system
   const ui = SwaggerUIBundle({
-    url: "{{.URL}}",
+    url: "{{.SwaggerSpecFullURL}}",
     dom_id: '#swagger-ui',
     validatorUrl: null,
     presets: [
@@ -162,6 +191,14 @@ window.onload = function() {
     ],
     layout: "StandaloneLayout"
   })
+
+  {{if .OAuth}}
+  ui.initOAuth({
+    clientId: "{{.OAuth.ClientId}}",
+    realm: "{{.OAuth.Realm}}",
+    appName: "{{.OAuth.AppName}}"
+  })
+  {{end}}
 
   window.ui = ui
 }
